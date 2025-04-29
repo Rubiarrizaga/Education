@@ -1,0 +1,146 @@
+import pandas as pd
+import numpy as np
+import os
+from tqdm import tqdm
+
+# Directorios
+data_all = "C:/Users/Usuario/Desktop/data_all"  # <- Ajusta esto si es necesario
+data_out = "C:/Users/Usuario/Desktop/data_out"  # <- Ajusta esto si es necesario
+
+#------------------------------------------------------------------------------
+#  Crear base limpia de escuelas: municipio, región, dependencia, ruralidad
+#------------------------------------------------------------------------------
+
+# Consolidar RBDs de 2004 a 2022
+rbd_list = []
+for year in tqdm(range(2004, 2023), desc="Procesando rendimiento escuelas"):
+    df = pd.read_stata(f"{data_all}/rendimiento/rendimiento{year}.dta")
+    df = df[['rbd', 'cod_com_rbd', 'cod_depe', 'rural_rbd']].drop_duplicates()
+    df['year'] = year
+    rbd_list.append(df)
+
+rbd_data = pd.concat(rbd_list, ignore_index=True)
+
+# Mantener solo el año más reciente por rbd
+rbd_data = rbd_data.sort_values(['rbd', 'year']).drop_duplicates('rbd', keep='last')
+
+# Homologar codigos de comuna
+comuna_base = pd.read_stata(f"{data_out}/comunaBase.dta")
+
+def corregir_codigo(codigo):
+    if pd.isna(codigo):
+        return np.nan
+    codigo = str(int(codigo)).zfill(5)
+    return codigo
+
+for refyear in [2000, 2008, 2010, 2018]:
+    rbd_data[f'Cod_Comuna_{refyear}'] = rbd_data['cod_com_rbd'].apply(corregir_codigo)
+    comuna_base_temp = comuna_base[['Cod_Comuna_'+str(refyear), 'Cod_Comuna_2018']].drop_duplicates()
+    rbd_data = rbd_data.merge(comuna_base_temp, left_on=f'Cod_Comuna_{refyear}', right_on=f'Cod_Comuna_{refyear}', how='left')
+    rbd_data = rbd_data.rename(columns={'Cod_Comuna_2018': f'Cod_Comuna_2018_{refyear}'})
+    rbd_data = rbd_data.drop(columns=[f'Cod_Comuna_{refyear}'])
+
+# Consolidar código de comuna definitivo
+rbd_data['Cod_Comuna_2018'] = rbd_data['Cod_Comuna_2018_2000']
+for refyear in [2008, 2010, 2018]:
+    rbd_data['Cod_Comuna_2018'] = np.where(rbd_data['Cod_Comuna_2018'].isna(), rbd_data[f'Cod_Comuna_2018_{refyear}'], rbd_data['Cod_Comuna_2018'])
+
+# Crear comuna y región como números
+rbd_data['Comuna_rbd'] = pd.to_numeric(rbd_data['Cod_Comuna_2018'], errors='coerce')
+rbd_data['Region_rbd'] = (rbd_data['Comuna_rbd'] // 1000).astype('Int64')
+
+# Crear tipo de dependencia
+rbd_data['type_school'] = np.select(
+    [
+        rbd_data['cod_depe'].isin([1, 2, 5, 6]),
+        rbd_data['cod_depe'] == 3,
+        rbd_data['cod_depe'] == 4
+    ],
+    [1, 2, 3],
+    default=np.nan
+)
+
+# Variables finales
+rbd_final = rbd_data[['rbd', 'cod_depe', 'rural_rbd', 'Comuna_rbd', 'Region_rbd', 'type_school']].drop_duplicates()
+rbd_final = rbd_final.sort_values('rbd')
+
+# Guardar
+rbd_final.to_parquet(f"{data_out}/rbd.parquet", index=False)
+
+#------------------------------------------------------------------------------
+# (1) Crear panel de todos los estudiantes 2004-2022
+#------------------------------------------------------------------------------
+
+panel_list = []
+for year in tqdm(range(2004, 2023), desc="Procesando matrícula alumnos"):
+    df = pd.read_stata(f"{data_all}/matricula_mineduc/matricula_mineduc{year}.dta")
+    df = df[['mrun', 'fec_nac_alu', 'gen_alu']].drop_duplicates('mrun')
+    df['yob'] = df['fec_nac_alu'].astype(str).str[:4].astype(float)
+    df['year_original'] = year
+    panel_list.append(df)
+
+panel = pd.concat(panel_list, ignore_index=True)
+
+# Consolidar únicos mrun
+panel = panel.sort_values(['mrun', 'fec_nac_alu']).drop_duplicates('mrun', keep='last')
+panel = panel[['mrun', 'yob', 'gen_alu', 'fec_nac_alu']]
+
+# Expandir a 19 años
+expanded_panel = panel.loc[panel.index.repeat(19)].copy()
+expanded_panel['year'] = np.tile(range(2004, 2023), len(panel))
+
+# Guardar
+expanded_panel.to_parquet(f"{data_out}/panel.parquet", index=False)
+
+#------------------------------------------------------------------------------
+# (2) Crear base de logros estudiantiles (attainment)
+#------------------------------------------------------------------------------
+
+attain_list = []
+for year in tqdm(range(2004, 2023), desc="Procesando rendimiento alumnos"):
+    df = pd.read_stata(f"{data_all}/rendimiento/rendimiento{year}.dta")
+    
+    df = df[['mrun', 'prom_gral', 'asistencia', 'cod_reg_rbd', 'cod_com_rbd', 'cod_com_alu', 'cod_ense', 'cod_grado', 'rbd', 'cod_depe', 'let_cur']]
+
+    df['year'] = year
+    df['prom_gral'] = pd.to_numeric(df['prom_gral'], errors='coerce')
+    df['asistencia'] = pd.to_numeric(df['asistencia'], errors='coerce')
+
+    df = df.sort_values(['mrun', 'year', 'asistencia']).drop_duplicates(['mrun', 'year'], keep='last')
+
+    attain_list.append(df)
+
+attain = pd.concat(attain_list, ignore_index=True)
+
+# Crear variable wildfire season
+attain['season'] = (attain['year'] - 1).astype(str) + '-' + attain['year'].astype(str)
+
+# Arreglar comuna de alumno
+attain['cod_com_alu'] = np.where(attain['cod_com_alu'] == 0, attain['cod_com_rbd'], attain['cod_com_alu'])
+
+# Homologar comuna del alumno
+for refyear in [2000, 2008, 2010, 2018]:
+    attain[f'cod_comuna_txt_{refyear}'] = attain['cod_com_alu'].apply(corregir_codigo)
+    comuna_base_temp = comuna_base[['Cod_Comuna_'+str(refyear), 'Cod_Comuna_2018']].drop_duplicates()
+    attain = attain.merge(comuna_base_temp, left_on=f'cod_comuna_txt_{refyear}', right_on=f'Cod_Comuna_'+str(refyear), how='left')
+    attain = attain.rename(columns={'Cod_Comuna_2018': f'Cod_Comuna_2018_{refyear}'})
+    attain = attain.drop(columns=[f'cod_comuna_txt_{refyear}', f'Cod_Comuna_{refyear}'])
+
+attain['Cod_Comuna_2018'] = attain['Cod_Comuna_2018_2000']
+for refyear in [2008, 2010, 2018]:
+    attain['Cod_Comuna_2018'] = np.where(attain['Cod_Comuna_2018'].isna(), attain[f'Cod_Comuna_2018_{refyear}'], attain['Cod_Comuna_2018'])
+
+attain['Comuna_alu'] = pd.to_numeric(attain['Cod_Comuna_2018'], errors='coerce')
+attain = attain.drop(columns=[col for col in attain.columns if 'Cod_Comuna_2018_' in col] + ['Cod_Comuna_2018'])
+
+# Merge a nivel escuela
+attain = attain.merge(rbd_final, on='rbd', how='left')
+
+# Eliminar estudiantes sin mrun
+attain = attain.dropna(subset=['mrun'])
+attain = attain.sort_values(['mrun', 'year'])
+
+# Guardar
+attain.to_parquet(f"{data_out}/attainment.parquet", index=False)
+
+print("Proceso completado. Archivos guardados en carpeta de salida.")
